@@ -36,18 +36,26 @@
 #define NUM_THREADS 0
 #endif
 
+// Alignment of the pack buffers in bytes: one cache line on Apple Silicon.
 #define CACHE_LINE 128
 
+// Purpose: minimum of two 64-bit integers.
+// Input:   a, b - the values to compare.
+// Output:  the smaller of a and b.
 static inline int64_t min64(const int64_t a, const int64_t b) {
   return a < b ? a : b;
 }
 
-// Length of the blocks a dimension of size n is split into: the fewest blocks
-// that respect max_block, all about equally long, so there is never a tiny
-// tail block. n = 2050, max_block = 512 gives 5 blocks of 410, not 4 x 512 + 2.
-// `unit` is the kernel tile size along this dimension (MR, NR, or 1): the
-// length is rounded up to whole tiles when the cap allows it, so that only the
-// last block can end in an edge tile.
+// Purpose: choose the length of the blocks a dimension is split into. Uses the
+//          fewest blocks that respect max_block and makes them about equally
+//          long, so there is never a tiny tail block: n = 2050 with
+//          max_block = 512 gives 5 blocks of 410, not 4 x 512 + 2.
+// Input:   n         - length of the dimension (>= 1).
+//          max_block - longest block allowed (the cache block size).
+//          unit      - kernel tile size along this dimension (MR, NR, or 1).
+// Output:  the block length, at most max_block. It is rounded up to a multiple
+//          of unit when the cap allows it, so that only the last block can end
+//          in an edge tile. It can therefore exceed n; callers clamp it.
 static int64_t block_size(const int64_t n, const int64_t max_block,
                           const int64_t unit) {
   const int64_t count = (n + max_block - 1) / max_block;
@@ -56,26 +64,53 @@ static int64_t block_size(const int64_t n, const int64_t max_block,
   return whole <= max_block ? whole : even;
 }
 
+// Purpose: load row r of the 6x8 tile of C into four NEON registers.
+// Input:   r - row index 0..5. It must be a literal digit, because it is
+//              pasted into the variable names.
+//          Also reads, from the enclosing scope, `c` (top-left element of the
+//          tile) and `rs` (row stride of c, in doubles).
+// Output:  declares c<r>0 .. c<r>3 in the enclosing scope, each holding two
+//          adjacent doubles of the row (LOAD_ROW(2) declares c20 .. c23).
 #define LOAD_ROW(r)                                                            \
   float64x2_t c##r##0 = vld1q_f64(c + r * rs + 0);                             \
   float64x2_t c##r##1 = vld1q_f64(c + r * rs + 2);                             \
   float64x2_t c##r##2 = vld1q_f64(c + r * rs + 4);                             \
   float64x2_t c##r##3 = vld1q_f64(c + r * rs + 6);
 
+// Purpose: write row r of the tile from its registers back to C.
+// Input:   r - row index 0..5, a literal digit.
+//          Also reads c<r>0 .. c<r>3, `c` and `rs` from the enclosing scope.
+// Output:  overwrites the 8 doubles c[r * rs] .. c[r * rs + 7].
 #define STORE_ROW(r)                                                           \
   vst1q_f64(c + r * rs + 0, c##r##0);                                          \
   vst1q_f64(c + r * rs + 2, c##r##1);                                          \
   vst1q_f64(c + r * rs + 4, c##r##2);                                          \
   vst1q_f64(c + r * rs + 6, c##r##3);
 
+// Purpose: add one term to row r of the tile: C(r, 0:8) += a(r) * b(0:8),
+//          done as four fused multiply-adds of two doubles each.
+// Input:   r    - row index 0..5, a literal digit.
+//          vec  - register holding two consecutive entries of the A sliver.
+//          lane - 0 or 1: which of the two entries in vec is a(r).
+//          Also reads b0 .. b3 from the enclosing scope: the 8 entries of the
+//          B sliver for the current term.
+// Output:  updates c<r>0 .. c<r>3 in place.
 #define FMA_ROW(r, vec, lane)                                                  \
   c##r##0 = vfmaq_laneq_f64(c##r##0, b0, vec, lane);                           \
   c##r##1 = vfmaq_laneq_f64(c##r##1, b1, vec, lane);                           \
   c##r##2 = vfmaq_laneq_f64(c##r##2, b2, vec, lane);                           \
   c##r##3 = vfmaq_laneq_f64(c##r##3, b3, vec, lane);
 
-// C(0:6, 0:8) += a * b, with a and b packed; rs is the row stride of c.
-// Uses 24 registers for C, 4 for b and 3 for a.
+// Purpose: the micro-kernel. Computes C(0:6, 0:8) += a * b for one full tile.
+//          The tile lives in 24 registers for the whole loop (4 more hold b
+//          and 3 hold a), so C is read once and written once.
+// Input:   kc - number of terms to accumulate.
+//          a  - packed A sliver: kc groups of MR doubles, one group per term.
+//          b  - packed B sliver: kc groups of NR doubles, one group per term.
+//          c  - top-left element of the tile in C. MR rows of NR doubles are
+//               read and written.
+//          rs - row stride of c: doubles between the starts of two rows.
+// Output:  the 6x8 tile at c is updated in place.
 static inline void kernel_6x8(const int64_t kc, const double *restrict a,
                               const double *restrict b, double *restrict c,
                               const int64_t rs) {
@@ -101,7 +136,17 @@ static inline void kernel_6x8(const int64_t kc, const double *restrict a,
   STORE_ROW(0) STORE_ROW(1) STORE_ROW(2) STORE_ROW(3) STORE_ROW(4) STORE_ROW(5)
 }
 
-// Edge tile: run the full kernel on a zeroed buffer, then add the valid part.
+// Purpose: micro-kernel for a partial tile at the bottom or right edge of a
+//          block, where a full 6x8 tile would write outside the valid part of
+//          C. Runs the full kernel into a zeroed buffer, then adds only the
+//          valid entries to C. The slivers are zero-padded by the packing
+//          routines, so the unused entries of the buffer are harmless.
+// Input:   mr, nr - valid rows (1..MR) and valid columns (1..NR) of the tile.
+//          kc, a, b - as in kernel_6x8.
+//          c  - top-left element of the tile in C. Only mr rows of nr doubles
+//               are read and written.
+//          rs - row stride of c.
+// Output:  the mr x nr tile at c is updated in place.
 static void kernel_edge(const int64_t mr, const int64_t nr, const int64_t kc,
                         const double *restrict a, const double *restrict b,
                         double *restrict c, const int64_t rs) {
@@ -115,7 +160,17 @@ static void kernel_edge(const int64_t mr, const int64_t nr, const int64_t kc,
   }
 }
 
-// Packs rows x kc of A into slivers of MR rows, zero-padding the last one.
+// Purpose: copy a rows x kc piece of A into the layout the kernel reads:
+//          slivers of MR rows, each stored term by term (the MR entries of
+//          column p, then those of column p + 1, ...), so the kernel walks it
+//          with stride 1. A last sliver with fewer than MR rows is padded
+//          with zeros.
+// Input:   rows - rows to pack.
+//          kc   - columns (terms) to pack.
+//          src  - top-left element of the piece in A, row-major.
+//          lda  - row stride of A in doubles (its number of columns).
+//          dst  - destination, with room for ceil(rows / MR) * MR * kc doubles.
+// Output:  dst is filled. Nothing is returned.
 static void pack_A(const int64_t rows, const int64_t kc,
                    const double *restrict src, const int64_t lda,
                    double *restrict dst) {
@@ -133,7 +188,16 @@ static void pack_A(const int64_t rows, const int64_t kc,
   }
 }
 
-// Packs kc x cols of B into slivers of NR columns, zero-padding the last one.
+// Purpose: copy a kc x cols piece of B into slivers of NR columns, each
+//          stored term by term (the NR entries of row p, then those of row
+//          p + 1, ...). A last sliver with fewer than NR columns is padded
+//          with zeros.
+// Input:   kc   - rows (terms) to pack.
+//          cols - columns to pack.
+//          src  - top-left element of the piece in B, row-major.
+//          ldb  - row stride of B in doubles (its number of columns).
+//          dst  - destination, with room for kc * ceil(cols / NR) * NR doubles.
+// Output:  dst is filled. Nothing is returned.
 static void pack_B(const int64_t kc, const int64_t cols,
                    const double *restrict src, const int64_t ldb,
                    double *restrict dst) {
@@ -151,6 +215,10 @@ static void pack_B(const int64_t kc, const int64_t cols,
   }
 }
 
+// Purpose: allocate a pack buffer aligned to a cache line.
+// Input:   count - number of doubles the buffer must hold.
+// Output:  pointer to the buffer, to be released with free(). It is never
+//          NULL: the program aborts if the allocation fails.
 static double *alloc_pack(const int64_t count) {
   void *p = NULL;
   if (posix_memalign(&p, CACHE_LINE, count * sizeof(double)) != 0) {
@@ -159,6 +227,10 @@ static double *alloc_pack(const int64_t count) {
   return p;
 }
 
+// Purpose: decide how many worker threads to use.
+// Input:   none. Reads NUM_THREADS and the system's count of active cores.
+// Output:  NUM_THREADS if it is positive, otherwise the number of active
+//          cores, or 1 if that cannot be queried.
 static int64_t thread_count(void) {
   if (NUM_THREADS > 0) {
     return NUM_THREADS;
@@ -172,16 +244,24 @@ static int64_t thread_count(void) {
   return count;
 }
 
+// One piece of parallel work. args describes the whole job and is shared by
+// every call; idx says which piece this call handles.
 typedef void (*task_fn)(const void *args, int64_t idx);
 
+// State of one parallel_for call, shared by all its workers.
 typedef struct {
-  task_fn fn;
-  const void *args;
-  int64_t count;
-  _Atomic int64_t next;
+  task_fn fn;           // the task to run
+  const void *args;     // passed unchanged to every task
+  int64_t count;        // number of tasks: idx runs over 0 .. count - 1
+  _Atomic int64_t next; // lowest task index nobody has claimed yet
 } parallel_job;
 
-// Tasks come from a shared counter, so slower cores simply take fewer of them.
+// Purpose: body of one worker thread. Claims the next unclaimed task index
+//          and runs it, over and over, until none are left. Tasks come from a
+//          shared counter, so slower cores simply take fewer of them.
+// Input:   ctx    - the parallel_job being executed.
+//          worker - worker number supplied by dispatch_apply_f. Unused.
+// Output:  none. Returns once every task has been claimed.
 static void parallel_worker(void *ctx, size_t worker) {
   (void)worker;
   parallel_job *const job = ctx;
@@ -196,6 +276,14 @@ static void parallel_worker(void *ctx, size_t worker) {
   }
 }
 
+// Purpose: run fn(args, idx) for every idx in 0 .. count - 1, spread over
+//          worker threads, and wait for all of them.
+// Input:   threads - number of workers to start.
+//          count   - number of tasks.
+//          fn      - the task. It is called from several threads at once, so
+//                    different idx values must not write the same memory.
+//          args    - passed unchanged to every call of fn.
+// Output:  none. Returns once every task has finished.
 static void parallel_for(const int64_t threads, const int64_t count,
                          const task_fn fn, const void *const args) {
   parallel_job job = {fn, args, count, 0};
@@ -206,12 +294,17 @@ static void parallel_for(const int64_t threads, const int64_t count,
 
 // Current block, shared read-only by the tasks of one parallel region.
 typedef struct {
-  int64_t kc, rows, cols;
-  int64_t ld_a, ld_b, ld_c;
-  const double *A_src, *B_src;
-  double *A_pack, *B_pack, *C;
+  int64_t kc, rows, cols;      // block size: terms, rows, columns
+  int64_t ld_a, ld_b, ld_c;    // row strides of A, B and C, in doubles
+  const double *A_src, *B_src; // top-left element of the block in A and in B
+  double *A_pack, *B_pack, *C; // pack buffers; top-left of the block in C
 } gemm_block;
 
+// Purpose: parallel task that packs one MR-row sliver of the current A block.
+// Input:   args - the gemm_block describing the block.
+//          idx  - sliver index: rows idx * MR .. idx * MR + MR - 1.
+// Output:  fills that sliver's MR * kc doubles in A_pack. Different idx values
+//          write disjoint parts of the buffer.
 static void pack_A_task(const void *args, const int64_t idx) {
   const gemm_block *const g = args;
   const int64_t i = idx * MR;
@@ -219,6 +312,12 @@ static void pack_A_task(const void *args, const int64_t idx) {
          g->A_pack + i * g->kc);
 }
 
+// Purpose: parallel task that packs one NR-column sliver of the current B
+//          block.
+// Input:   args - the gemm_block describing the block.
+//          idx  - sliver index: columns idx * NR .. idx * NR + NR - 1.
+// Output:  fills that sliver's NR * kc doubles in B_pack. Different idx values
+//          write disjoint parts of the buffer.
 static void pack_B_task(const void *args, const int64_t idx) {
   const gemm_block *const g = args;
   const int64_t j = idx * NR;
@@ -226,7 +325,14 @@ static void pack_B_task(const void *args, const int64_t idx) {
          g->B_pack + j * g->kc);
 }
 
-// One task is one MR-row sliver of A: tasks write disjoint rows of C.
+// Purpose: parallel task that updates one strip of C: the MR rows of sliver
+//          idx, across every column of the block. Its A sliver stays in L1
+//          while the B slivers stream past, one kernel call per tile.
+// Input:   args - the gemm_block describing the block. A_pack and B_pack must
+//                 already hold the packed block.
+//          idx  - sliver index: rows idx * MR .. idx * MR + MR - 1.
+// Output:  adds this block's kc terms of A * B to that strip of C. Different
+//          idx values write disjoint rows of C.
 static void kernel_task(const void *args, const int64_t idx) {
   const gemm_block *const g = args;
   const int64_t ir = idx * MR;
@@ -246,6 +352,14 @@ static void kernel_task(const void *args, const int64_t idx) {
   }
 }
 
+// Purpose: C += A * B, the entry point declared in matmult.h. Splits the
+//          problem into cache-sized blocks. For each block it packs A and B,
+//          then runs the micro-kernel over every tile, using all cores.
+// Input:   M, N, K - the dimensions. Nothing is done unless all are positive.
+//          A - M x K matrix, row-major, read only.
+//          B - K x N matrix, row-major, read only.
+//          C - M x N matrix, row-major. It must not overlap A or B.
+// Output:  C is updated in place: C(i,j) += sum over p of A(i,p) * B(p,j).
 void matmult(const int64_t M, const int64_t N, const int64_t K,
              const double *const restrict A, const double *const restrict B,
              double *const restrict C) {
