@@ -16,12 +16,16 @@
 #define MR 6
 #define NR 8
 
-// Cache block sizes can be overridden at compile time, e.g. -DKC=512
+// Cache block sizes are upper bounds: block_size() picks the actual lengths.
+// They can be overridden at compile time, e.g. -DKC=512
 #ifndef KC
 #define KC 512 // terms per kernel call: slivers of A and B must fit in L1
 #endif
 #ifndef RC
-#define RC 1998 // rows per block (multiple of MR): packed A sits in L2
+// Rows per block (multiple of MR). Packed A is only streamed, one sliver per
+// kernel task, so it does not have to fit in L2: this just bounds its size.
+// It is large on purpose, because every extra row block repacks all of B.
+#define RC 12288
 #endif
 #ifndef CC
 #define CC 1024 // columns per block (multiple of NR): packed B sits in L2
@@ -36,6 +40,20 @@
 
 static inline int64_t min64(const int64_t a, const int64_t b) {
   return a < b ? a : b;
+}
+
+// Length of the blocks a dimension of size n is split into: the fewest blocks
+// that respect max_block, all about equally long, so there is never a tiny
+// tail block. n = 2050, max_block = 512 gives 5 blocks of 410, not 4 x 512 + 2.
+// `unit` is the kernel tile size along this dimension (MR, NR, or 1): the
+// length is rounded up to whole tiles when the cap allows it, so that only the
+// last block can end in an edge tile.
+static int64_t block_size(const int64_t n, const int64_t max_block,
+                          const int64_t unit) {
+  const int64_t count = (n + max_block - 1) / max_block;
+  const int64_t even = (n + count - 1) / count;
+  const int64_t whole = (even + unit - 1) / unit * unit;
+  return whole <= max_block ? whole : even;
 }
 
 #define LOAD_ROW(r)                                                            \
@@ -235,26 +253,28 @@ void matmult(const int64_t M, const int64_t N, const int64_t K,
     return;
   }
 
-  const int64_t max_kc = min64(KC, K);
-  const int64_t max_rows = (min64(RC, M) + MR - 1) / MR * MR;
-  const int64_t max_cols = (min64(CC, N) + NR - 1) / NR * NR;
-  double *const A_pack = alloc_pack(max_rows * max_kc);
-  double *const B_pack = alloc_pack(max_cols * max_kc);
+  const int64_t rc = block_size(M, RC, MR);
+  const int64_t kc = block_size(K, KC, 1);
+  const int64_t cc = block_size(N, CC, NR);
+
+  // Packing pads the last sliver, so round the buffers up to whole slivers.
+  double *const A_pack = alloc_pack((rc + MR - 1) / MR * MR * kc);
+  double *const B_pack = alloc_pack((cc + NR - 1) / NR * NR * kc);
 
   const int64_t threads = thread_count();
   gemm_block g = {.ld_a = K, .ld_b = N, .ld_c = N,
                   .A_pack = A_pack, .B_pack = B_pack};
 
-  for (int64_t ii = 0; ii < M; ii += RC) {
-    g.rows = min64(RC, M - ii);
+  for (int64_t ii = 0; ii < M; ii += rc) {
+    g.rows = min64(rc, M - ii);
 
-    for (int64_t pp = 0; pp < K; pp += KC) {
-      g.kc = min64(KC, K - pp);
+    for (int64_t pp = 0; pp < K; pp += kc) {
+      g.kc = min64(kc, K - pp);
       g.A_src = &A[ii * K + pp];
       parallel_for(threads, (g.rows + MR - 1) / MR, pack_A_task, &g);
 
-      for (int64_t jj = 0; jj < N; jj += CC) {
-        g.cols = min64(CC, N - jj);
+      for (int64_t jj = 0; jj < N; jj += cc) {
+        g.cols = min64(cc, N - jj);
         g.B_src = &B[pp * N + jj];
         g.C = &C[ii * N + jj];
         parallel_for(threads, (g.cols + NR - 1) / NR, pack_B_task, &g);
