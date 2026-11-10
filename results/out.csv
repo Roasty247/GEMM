@@ -1,0 +1,2 @@
+name,lastname,variant,M,N,K,seconds,throughput
+Ofir,Yaffe,./matmult_pji-opt,1000,1000,1000,1.593694,1.254946

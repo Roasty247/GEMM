@@ -1,0 +1,2 @@
+name,lastname,variant,M,N,K,seconds,throughput
+Ofir,Yaffe,./build/matmult-opt,1000,1000,1000,0.036959,54.114018

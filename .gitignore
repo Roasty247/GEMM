@@ -1,0 +1,22 @@
+# Compiled binaries (regenerate with `make opt` / `make debug`)
+build/
+*.o
+*.dSYM/
+
+# Python virtual environment (recreate from requirements.txt)
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Temporary per-variant CSVs the Makefile writes and then deletes
+results/perf_*.csv
+results/test_*.csv
+
+# Course assignment sheet (not ours to redistribute)
+challenge_exercise.pdf
+
+# macOS / editor noise
+.DS_Store
+.vscode/
+.idea/
